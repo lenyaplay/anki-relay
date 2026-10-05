@@ -24,8 +24,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "and never stored on this server."
         ),
         "err_invalid": "Invalid email or password.",
-        "err_timeout": "AnkiWeb did not respond. Please try again later.",
-        "err_network": "No connection to AnkiWeb. Please try again later.",
+        "err_sync": "The sync server returned an error. Please try again later.",
+        "err_network": (
+            "A network error occurred while contacting the sync server. Please try again later."
+        ),
         "err_blocked": "Too many failed attempts. Please try again later.",
         "err_missing": "Enter your email and password.",
         "err_expired": (
@@ -45,8 +47,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "Войдите аккаунтом AnkiWeb. Пароль проверяется у AnkiWeb и на сервере не сохраняется."
         ),
         "err_invalid": "Неверный email или пароль.",
-        "err_timeout": "AnkiWeb не ответил. Попробуйте позже.",
-        "err_network": "Нет связи с AnkiWeb. Попробуйте позже.",
+        "err_sync": "Сервер синхронизации вернул ошибку. Попробуйте позже.",
+        "err_network": "Сетевая ошибка при обращении к серверу синхронизации. Попробуйте позже.",
         "err_blocked": "Слишком много неудачных попыток. Попробуйте позже.",
         "err_missing": "Введите email и пароль.",
         "err_expired": (

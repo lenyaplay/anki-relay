@@ -88,6 +88,9 @@ class Settings(BaseSettings):
     data_dir: Path = Path("/data")
     log_dir: Path | None = Path("/logs")
     log_retention_days: int = Field(default=14, ge=1)
+    # Log of the anki library's Rust part (sync metadata, sync decisions, network
+    # errors) in LOG_DIR/anki-rust.log; off by default (REQ-005).
+    anki_rust_log: Literal["off", "error", "warn", "info", "debug", "trace"] = "off"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     @field_validator("public_url")

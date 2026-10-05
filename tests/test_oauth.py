@@ -214,13 +214,13 @@ def test_wrong_password(live_factory, fake) -> None:
     assert flow.login(req).status_code == 302  # the same link still works after a typo
 
 
-def test_ankiweb_unreachable(live_factory, fake) -> None:
+def test_sync_network_error_during_sign_in(live_factory, fake) -> None:
     server = live_factory(default_language="ru")
     flow = Flow(server)
     flow.register()
     fake.login_error = NetworkError("down", None, None, None)
     r = flow.login(flow.authorize())
-    assert r.status_code == 502 and "Нет связи с AnkiWeb" in r.text
+    assert r.status_code == 502 and "Сетевая ошибка при обращении к серверу синхронизации" in r.text
 
 
 # ---------------------------------------------------------------- tokens

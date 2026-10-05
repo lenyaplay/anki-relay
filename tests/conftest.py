@@ -65,6 +65,7 @@ class FakeAnkiWeb(AnkiSyncBackend):
         self._seen: set[str] = set()
         self.passwords = {EMAIL: PASSWORD, EMAIL_B: PASSWORD}
         self.login_error: Exception | None = None
+        self.media_error: Exception | None = None
 
     # login
     def login(
@@ -109,6 +110,8 @@ class FakeAnkiWeb(AnkiSyncBackend):
         self._polls = self.media_active_polls
 
     def media_sync_status(self, col: Collection) -> Any:
+        if self.media_error is not None:
+            raise self.media_error
         polls = getattr(self, "_polls", 0)
         if polls > 0:
             self._polls = polls - 1

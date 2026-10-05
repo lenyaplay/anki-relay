@@ -114,7 +114,7 @@ async def test_no_secrets_or_card_content_in_log_file(logs: Path, live_factory) 
     failed = next(e for e in calls if e["tool"] == "get_note_type")
     assert failed["outcome"] == "error" and "Unknown note type" in failed["error"]
     events = {e.get("event") for e in entries}
-    assert {"auth.login", "auth.token", "auth.refresh", "sync.normal"} <= events
+    assert {"auth.login", "auth.token", "auth.refresh", "sync.request"} <= events
 
 
 async def test_sync_events_carry_the_call_id(logs: Path, harness_factory) -> None:
@@ -123,7 +123,7 @@ async def test_sync_events_carry_the_call_id(logs: Path, harness_factory) -> Non
     await h.call("find_notes", query="")
     entries = records(logs)
     call = next(e for e in entries if e.get("event") == "tool.call")
-    sync = [e for e in entries if e.get("event") == "sync.normal"]
+    sync = [e for e in entries if e.get("event") == "sync.request" and e["step"] == "meta"]
     assert sync and all(e["call_id"] == call["call_id"] for e in sync)
     assert sync[0]["user"] == user_id_for(EMAIL) and sync[0]["reason"] == "pull"
     assert sync[0]["required"] == "FULL_DOWNLOAD"
@@ -323,3 +323,73 @@ async def test_debug_bundle(logs: Path, harness_factory, monkeypatch, capsys) ->
     main(["debug-bundle", "--days", "1"])
     printed = Path(capsys.readouterr().out.strip())
     assert printed.exists() and printed.parent == logs.parent
+
+
+# ---------------------------------------------------------------- REQ-005: sync diagnostics
+
+HTTP_ERROR_TEXT = 'HttpError { code: 400, context: "missing original size", source: None }'
+
+
+async def test_failed_request_is_logged_literally_and_recovery_too(
+    logs: Path, harness_factory
+) -> None:
+    from anki.errors import SyncError, SyncErrorKind
+
+    h: Harness = await harness_factory(sync_pull_interval=0)
+    h.sign_in()
+    h.fake.full_sync_error = SyncError(HTTP_ERROR_TEXT, None, None, None, SyncErrorKind.OTHER)
+    msg = await h.fails("collection_overview")
+    assert HTTP_ERROR_TEXT in msg  # the library's text, verbatim
+    h.fake.full_sync_error = None
+    h.user().state.backoff_until = 0
+    await h.call("collection_overview")
+
+    entries = records(logs)
+    requests = [e for e in entries if e.get("event") == "sync.request"]
+    failed = next(e for e in requests if e["outcome"] == "error")
+    assert failed["step"] == "full_download"
+    assert failed["endpoint"] == "sync.example"
+    assert failed["attempt"] == 1
+    assert failed["error_type"] == "SyncError" and failed["error_kind"] == "OTHER"
+    assert failed["error_message"] == HTTP_ERROR_TEXT
+    assert failed["http_code"] == 400 and failed["http_context"] == "missing original size"
+    assert "diagnosis" not in failed
+    meta = next(e for e in requests if e["step"] == "meta")
+    assert meta["outcome"] == "ok" and meta["required"] == "FULL_DOWNLOAD"
+    assert {"server_message", "host_number", "new_endpoint"} <= meta.keys()
+    ok_download = [e for e in requests if e["step"] == "full_download" and e["outcome"] == "ok"]
+    assert ok_download and ok_download[0]["attempt"] == 2
+    recovered = next(e for e in entries if e.get("event") == "sync.recovered")
+    assert recovered["after_failures"] == 1 and recovered["seconds_since_first_failure"] >= 0
+
+
+async def test_media_errors_are_logged_once_per_message(logs: Path, harness_factory) -> None:
+    h: Harness = await harness_factory()
+    h.sign_in()
+    await h.call("collection_overview")
+    h.fake.media_error = RuntimeError("media sync broke")
+    for _ in range(3):
+        await h.call("sync_status")
+    failed = [e for e in records(logs) if e.get("event") == "sync.media_failed"]
+    assert len(failed) == 1
+    assert failed[0]["error_message"] == "media sync broke"
+    status = await h.call("sync_status")
+    assert status["media"]["last_error"] == "media sync broke"
+
+
+async def test_debug_bundle_includes_rust_log(logs: Path, harness_factory) -> None:
+    h: Harness = await harness_factory(log_dir=logs.parent)
+    (logs.parent / "anki-rust.log").write_text("rust line\n")
+    path = build_bundle(h.settings)
+    with tarfile.open(path) as tar:
+        assert "logs/anki-rust.log" in tar.getnames()
+
+
+def test_extra_fields_cannot_overwrite_core_json_fields() -> None:
+    from anki_relay.logging_setup import JsonFormatter
+
+    record = logging.LogRecord("x", logging.INFO, "", 0, "hello", (), None)
+    record.level = "debug"
+    record.msg_extra = 1
+    data = json.loads(JsonFormatter().format(record))
+    assert data["level"] == "INFO" and data["msg"] == "hello"

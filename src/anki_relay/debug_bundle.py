@@ -23,7 +23,7 @@ from typing import Any
 
 from .config import Settings
 from .fileutil import read_json
-from .logging_setup import LOG_FILE
+from .logging_setup import LOG_FILE, RUST_LOG_FILE
 from .users import user_id_for
 
 PACKAGES = ("anki-relay", "anki", "mcp", "httpx", "uvicorn", "starlette", "pydantic")
@@ -133,7 +133,11 @@ def build_bundle(settings: Settings, days: int | None = None, out_dir: Path | No
         for user_id, info in _users(settings, tokens).items():
             _add_bytes(tar, f"users/{user_id}.json", _dump(info))
         if settings.log_dir is not None and settings.log_dir.is_dir():
-            for log in sorted(settings.log_dir.glob(LOG_FILE + "*")):
+            logs = [
+                *settings.log_dir.glob(LOG_FILE + "*"),
+                *settings.log_dir.glob(RUST_LOG_FILE + "*"),
+            ]
+            for log in sorted(logs):
                 if cutoff is None or log.stat().st_mtime >= cutoff:
                     tar.add(log, arcname=f"logs/{log.name}")
 

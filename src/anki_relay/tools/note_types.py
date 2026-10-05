@@ -142,7 +142,7 @@ def apply_schema_ops(
                 tmpl["qfmt"] = op.get("front") or ""
                 tmpl["afmt"] = op.get("back") or ""
                 if not tmpl["qfmt"]:
-                    raise ToolError("add_template needs 'front' (and usually 'back')")
+                    raise ToolError("add_template needs 'front'; 'back' is optional")
                 mm.add_template(nt, tmpl)
                 if op.get("position") is not None:
                     mm.reposition_template(nt, nt["tmpls"][-1], _position(nt, "tmpls", op))

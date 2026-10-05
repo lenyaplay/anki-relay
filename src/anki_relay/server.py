@@ -22,7 +22,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from .auth import SCOPE, RelayOAuthProvider
 from .config import ConfigError, Settings, load_settings
 from .debug_bundle import build_bundle
-from .logging_setup import setup_logging
+from .logging_setup import setup_logging, setup_rust_logging
 from .media import MediaFetcher
 from .sync import AnkiSyncBackend, SyncManager
 from .tools import register_all
@@ -201,6 +201,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             return
         setup_logging(settings)
+        setup_rust_logging(settings)
         app = build_app(settings)
     except ConfigError as exc:
         print(f"anki-relay: {exc}", file=sys.stderr)

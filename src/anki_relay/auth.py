@@ -38,7 +38,7 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 from .config import Settings
 from .fileutil import read_json, write_private_json
 from .login_page import pick_language, render_expired, render_login
-from .sync import AnkiSyncBackend
+from .sync import AnkiSyncBackend, error_fields
 from .users import UserManager, user_id_for
 
 log = logging.getLogger(__name__)
@@ -450,22 +450,25 @@ class RelayOAuthProvider:
         except SyncError as exc:
             if exc.kind == SyncErrorKind.AUTH:
                 log.info(
-                    "AnkiWeb rejected credentials of user %s",
+                    "sync login of user %s rejected (authentication error)",
                     user.id,
                     extra={"event": "auth.failed", "user": user.id, "ip": ip},
                 )
                 return await failure("err_invalid", 401)
             log.warning(
-                "AnkiWeb error during sign-in: %s",
-                exc,
-                extra={"event": "auth.ankiweb_error", "user": user.id, "ip": ip},
+                "sync login raised SyncError",
+                extra={"event": "auth.sync_error", "user": user.id, "ip": ip, **error_fields(exc)},
             )
-            return page(render_login(lang, req_id, "err_timeout", email), 502)
+            return page(render_login(lang, req_id, "err_sync", email), 502)
         except NetworkError as exc:
             log.warning(
-                "no connection to AnkiWeb during sign-in: %s",
-                exc,
-                extra={"event": "auth.ankiweb_unreachable", "user": user.id, "ip": ip},
+                "sync login raised NetworkError",
+                extra={
+                    "event": "auth.sync_network_error",
+                    "user": user.id,
+                    "ip": ip,
+                    **error_fields(exc),
+                },
             )
             return page(render_login(lang, req_id, "err_network", email), 502)
 

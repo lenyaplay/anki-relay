@@ -154,6 +154,7 @@ the server at startup with a message naming the variable.
 | `LOG_LEVEL` | `INFO` | Passwords, tokens, emails and card contents are never logged at any level. |
 | `LOG_DIR` | `/logs` | JSON log files (mounted to `./logs`); empty = stdout only. |
 | `LOG_RETENTION_DAYS` | `14` | Days of log files to keep. |
+| `ANKI_RUST_LOG` | `off` | The anki library's own log (`off`…`trace`) in `logs/anki-rust.log`. |
 
 A restricted setup — no deletions, no resets, no schema changes, no media:
 
@@ -231,14 +232,15 @@ burst is 20–60 notes in half an hour):
   exponential pause (5 s, 10 s, 20 s … up to 5 minutes). Meanwhile tools keep
   working on the server copy and say so. `sync_status` shows the state.
 - **Full syncs.** The server never uploads the whole collection during normal
-  work. When AnkiWeb asks for a full sync — typically after you restructured a note
-  type in Anki Desktop — the server decides like this:
+  work. When AnkiWeb answers with a full sync (the integration test shows this, for
+  example, after a note type was restructured on another device), the server
+  decides like this:
 
   | Situation | What happens |
   |---|---|
   | The server copy has nothing that AnkiWeb lacks (no unsynced changes, no local schema change) | It downloads the collection from AnkiWeb by itself, after a backup; nothing is lost. The tool result carries a warning. |
   | The server copy has unsynced changes | Error with a structured `full_sync` block (`safe_to_download: false` …). Claude tells you what would be lost and calls `sync(force_download=true)` only after you confirm. |
-  | The collection on AnkiWeb is empty (`ankiweb_empty: true`) | Never handled automatically: check whether AnkiWeb was reset on purpose, upload from Anki on your computer, then `sync(force_download=true)`. |
+  | AnkiWeb answers `FULL_UPLOAD`, i.e. it offers only a one-way upload (`download_offered: false`; in tests this happened when the AnkiWeb collection was empty) | Never handled automatically: the server never uploads. Decide yourself; `sync(force_download=true)` would replace the server copy with what AnkiWeb has. |
 
   `sync_status` shows the same `full_sync` block while the situation lasts. A
   download only replaces the server copy; AnkiWeb and your devices are untouched.
@@ -336,6 +338,20 @@ Logs can only be read on the server itself — nothing serves them over HTTP or 
   It contains the logs, versions, the configuration (emails replaced by user ids) and
   each user's sync state, collection/media sizes and backup list. It never contains
   AnkiWeb keys, OAuth data, collections or media.
+- **Sync diagnostics.** Every request to the sync server writes a `sync.request`
+  record: step (`meta`, `full_download`, `full_upload`, `media_start`), endpoint
+  host, attempt, duration and, on failure, the error exactly as the anki library
+  reported it (`error_type`, `error_kind`, `error_message`, plus `http_code` and
+  `http_context` when the text has the form `HttpError { code: …, context: … }`).
+  Nothing is interpreted. `sync.recovered` marks the first success after failures,
+  `sync.media_failed` a media sync error.
+- **The anki library's own log.** `ANKI_RUST_LOG=debug` (default `off`) writes
+  `./logs/anki-rust.log` (the previous run is kept as `.1`; the lines also appear
+  in `docker compose logs`). At `debug` it shows the sync metadata of both sides,
+  the full-sync decision (`upload_ok` / `download_ok`) and network errors; tests
+  check it contains no password, AnkiWeb key or email. HTTP responses (status,
+  headers, body) are not visible there or anywhere else: the library does not
+  expose them. Turn it on while investigating, then back off.
 
 Find a user's id: first 16 hex characters of the SHA-256 of the lowercase email,
 e.g. `python3 -c "import hashlib;print(hashlib.sha256(b'me@example.com').hexdigest()[:16])"`.

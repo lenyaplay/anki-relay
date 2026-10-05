@@ -180,7 +180,7 @@ async def test_clean_copy_downloads_automatically(harness_factory, answer: int) 
     await first_call(h)
     h.fake.script = [answer]
     res = await h.call("find_notes", query="")
-    assert "nothing was lost" in res["warnings"][0]
+    assert "was replaced with the collection from the sync server" in res["warnings"][0]
     assert "-before-download.anki2" in res["warnings"][0]
     assert h.fake.calls["full_download"] == 2
     assert h.fake.uploads.count(True) == 0
@@ -199,7 +199,7 @@ async def test_unsynced_changes_block_automatic_download(harness_factory) -> Non
     block = full_sync_block(msg)
     assert block["answer"] == "FULL_SYNC"
     assert block["unsynced_changes_on_server"] is True
-    assert block["safe_to_download"] is False and block["ankiweb_empty"] is False
+    assert block["safe_to_download"] is False and block["download_offered"] is True
     assert "only after they confirm" in msg
     assert h.fake.calls["full_download"] == 1  # only the initial one
     status = await h.call("sync_status")
@@ -229,8 +229,8 @@ async def test_empty_ankiweb_is_never_handled_automatically(harness_factory) -> 
     h.fake.script = [SyncOutput.FULL_UPLOAD]
     msg = await h.fails("find_notes", query="")
     block = full_sync_block(msg)
-    assert block["ankiweb_empty"] is True and block["safe_to_download"] is False
-    assert "reset on purpose" in msg
+    assert block["download_offered"] is False and block["safe_to_download"] is False
+    assert "Ask the user how to proceed" in msg
     assert h.fake.calls["full_download"] == 1 and h.fake.uploads.count(True) == 0
 
 
@@ -352,7 +352,7 @@ async def test_exponential_backoff(h: Harness) -> None:
     calls = h.fake.calls["sync"]
     res = await h.call("find_notes", query="")
     assert h.fake.calls["sync"] == calls
-    assert "unreachable" in res["warnings"][0]
+    assert "The last sync attempt failed" in res["warnings"][0]
 
     # the push loop retries after the backoff and recovers
     user.state.backoff_until = time.time() + 0.2

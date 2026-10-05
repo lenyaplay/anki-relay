@@ -11,11 +11,11 @@ def register(r: Registry) -> None:
 
     @r.tool()
     async def sync(force_download: bool = False) -> str:
-        """Sync with AnkiWeb now, ignoring the usual intervals, then sync media
-        (waits up to 30 s). force_download=true replaces the server copy with the
-        collection from AnkiWeb (use it when told a full sync is required, after
-        syncing Anki on the user's computer); a backup of the server copy is kept.
-        If a one-way upload after a schema change is pending, sync() retries it."""
+        """Sync with the sync server (AnkiWeb unless SYNC_ENDPOINT is set) now,
+        ignoring the usual intervals, then sync media (waits up to 30 s).
+        force_download=true replaces the server copy with the collection from the sync
+        server; a backup of the server copy is kept. If a one-way upload after a schema
+        change is pending, sync() retries it."""
 
         def run(user: User) -> Result:
             with user.lock:
@@ -38,7 +38,7 @@ def register(r: Registry) -> None:
         """When the last successful sync was, whether there are unsynced changes,
         whether a one-way upload after a schema change is pending, the last error and
         when the next attempt happens, and media sync progress. Does not contact
-        AnkiWeb."""
+        the sync server."""
 
         def run(user: User) -> Result:
             with user.lock:

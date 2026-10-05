@@ -27,6 +27,8 @@ from urllib.parse import urlsplit
 from .config import Settings
 
 LOG_FILE = "anki-relay.log"
+RUST_LOG_FILE = "anki-rust.log"
+_rust_logging_started = False
 
 # Set by the tool wrapper for the duration of one tool call; copied into worker
 # threads by asyncio.to_thread, so sync events are tied to the call that caused them.
@@ -186,7 +188,7 @@ class JsonFormatter(logging.Formatter):
             "msg": record.getMessage(),
         }
         for key, value in record.__dict__.items():
-            if key not in _STANDARD_ATTRS and not key.startswith("_"):
+            if key not in _STANDARD_ATTRS and not key.startswith("_") and key not in data:
                 data[key] = value
         if record.exc_info:
             data["exc"] = self.formatException(record.exc_info)
@@ -250,6 +252,41 @@ def setup_logging(settings: Settings) -> list[logging.Handler]:
         logger.handlers.clear()
         logger.propagate = True
     return added
+
+
+def setup_rust_logging(settings: Settings) -> Path | None:
+    """Turn on the anki library's own (Rust) log, once per process.
+
+    Uses ``anki._backend.RustBackend.initialize_logging(path)``: the public
+    ``Collection.initialize_backend_logging()`` only logs to the terminal. Must run
+    before any collection is opened. Returns the log file, or None for stderr.
+    """
+    global _rust_logging_started
+    if settings.anki_rust_log == "off" or _rust_logging_started:
+        return None
+    from anki._backend import RustBackend
+
+    os.environ["RUST_LOG"] = settings.anki_rust_log
+    # Without this the Rust logger writes ANSI colour codes into the file.
+    os.environ.setdefault("NO_COLOR", "1")
+    path: Path | None = None
+    if settings.log_dir is not None:
+        settings.log_dir.mkdir(parents=True, exist_ok=True)
+        path = Path(settings.log_dir) / RUST_LOG_FILE
+        # The Rust side owns this file and does not rotate it: keep one previous run.
+        if path.exists():
+            os.replace(path, path.with_name(RUST_LOG_FILE + ".1"))
+    RustBackend.initialize_logging(str(path) if path else None)
+    _rust_logging_started = True
+    if path is not None:
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
+    logging.getLogger(__name__).info(
+        "anki library log enabled at level %s",
+        settings.anki_rust_log,
+        extra={"event": "logging.rust", "rust_level": settings.anki_rust_log},
+    )
+    return path
 
 
 def remove_handlers(handlers: list[logging.Handler]) -> None:

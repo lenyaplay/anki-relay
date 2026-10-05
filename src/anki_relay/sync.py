@@ -23,15 +23,17 @@ import contextlib
 import contextvars
 import datetime as dt
 import logging
+import re
 import shutil
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
+from urllib.parse import urlsplit
 
 import anki.collection  # noqa: F401 - import order matters for anki
 from anki.collection import Collection
-from anki.errors import NetworkError, SyncError, SyncErrorKind
+from anki.errors import SyncError, SyncErrorKind
 from anki.sync import SyncAuth, SyncOutput
 
 from .config import Settings
@@ -46,15 +48,37 @@ BACKOFF_MAX = 300.0
 MEDIA_WAIT_SECONDS = 30.0
 MEDIA_POLL_SECONDS = 0.5
 
-FORCE_DOWNLOAD_HINT = (
-    "Sync Anki on your computer first, then call sync(force_download=true) to replace "
-    "the server copy with the one from AnkiWeb."
+# Texts for Claude and the user state only what the sync server or the anki library
+# returned, facts about the server copy, and what each action does. No guessed causes
+# (REQ-005; tests/test_messages.py guards against hedge words).
+FORCE_DOWNLOAD_EFFECT = (
+    "sync(force_download=true) replaces the server copy with the collection from the sync "
+    "server; a backup of the server copy is kept."
 )
 PENDING_SCHEMA_MSG = (
     "A note type structure change was applied on the server copy but its one-way upload "
-    "to AnkiWeb has not completed yet. Normal sync is paused until it does: call sync() "
-    "to retry the upload, or sync(force_download=true) to discard the change."
+    "to the sync server has not completed. Normal sync is paused until it does: sync() "
+    "retries the upload; sync(force_download=true) discards the change."
 )
+_HTTP_ERROR = re.compile(r'HttpError \{ code: (\d+), context: "((?:[^"\\]|\\.)*)"')
+
+
+def error_fields(exc: BaseException) -> dict[str, Any]:
+    """Log fields describing an exception, taken literally from it (no interpretation)."""
+    text = str(exc)
+    fields: dict[str, Any] = {"error_type": type(exc).__name__, "error_message": text[:1000]}
+    if isinstance(exc, SyncError):
+        fields["error_kind"] = exc.kind.name
+    match = _HTTP_ERROR.search(text)
+    if match:
+        fields["http_code"] = int(match.group(1))
+        fields["http_context"] = match.group(2)
+    return fields
+
+
+def _host(url: str | None) -> str | None:
+    """Host part of an endpoint URL; None means the anki library's default endpoint."""
+    return urlsplit(url).netloc or None if url else None
 
 
 class SyncProblem(Exception):
@@ -70,15 +94,15 @@ class SyncProblem(Exception):
 
 
 class SyncUnavailable(SyncProblem):
-    """Transient: network trouble, AnkiWeb errors or rate limiting; retried with backoff."""
+    """A sync attempt raised an error other than an authentication error; retried with backoff."""
 
 
 class SyncConflict(SyncProblem):
-    """AnkiWeb wants a full sync that the server will not do on its own."""
+    """The sync server answered with a full sync that this server will not do on its own."""
 
 
 class SyncAuthError(SyncProblem):
-    """AnkiWeb rejected the stored login."""
+    """The anki library classified the error as an authentication error."""
 
 
 class SchemaChangesDisabled(SyncProblem):
@@ -177,11 +201,28 @@ class SyncManager:
             raise self._auth_error()
         auth = user.load_auth()
         if auth is None:
-            raise SyncAuthError("No AnkiWeb login stored. Reconnect the connector in Claude.")
+            raise SyncAuthError(
+                "No sync login is stored for this user. Reconnect the connector in Claude."
+            )
         return auth
 
     def _record_success(self, user: User, gen: int) -> None:
         st = user.state
+        if st.failures:
+            log.info(
+                "sync of user %s succeeded after %d failed attempt(s)",
+                user.id,
+                st.failures,
+                extra={
+                    "event": "sync.recovered",
+                    "user": user.id,
+                    "after_failures": st.failures,
+                    "seconds_since_first_failure": (
+                        round(time.time() - st.failing_since, 1) if st.failing_since else None
+                    ),
+                },
+            )
+        st.failing_since = None
         st.last_sync = time.time()
         st.ever_synced = True
         st.failures = 0
@@ -197,6 +238,8 @@ class SyncManager:
     def _record_failure(self, user: User, message: str) -> None:
         st = user.state
         st.failures += 1
+        if st.failing_since is None:
+            st.failing_since = time.time()
         st.backoff_until = time.time() + min(BACKOFF_BASE * 2 ** (st.failures - 1), BACKOFF_MAX)
         st.last_sync_error = message
         user.save_state()
@@ -218,18 +261,69 @@ class SyncManager:
             user.state.auth_invalid = True
             user.save_state()
             return self._auth_error()
-        if isinstance(exc, NetworkError):
-            return SyncUnavailable(f"No connection to AnkiWeb: {exc}")
-        if isinstance(exc, SyncError):
-            return SyncUnavailable(f"AnkiWeb error: {exc}")
-        return SyncUnavailable(f"Sync failed: {exc}")
+        return SyncUnavailable(f"Sync failed ({type(exc).__name__}): {exc}")
 
     @staticmethod
     def _auth_error() -> SyncAuthError:
         return SyncAuthError(
-            "AnkiWeb rejected the saved login. Reconnect the connector in Claude "
-            "(Settings → Connectors) and sign in again."
+            "The sync server rejected the saved login (the anki library reported an "
+            "authentication error). Reconnect the connector in Claude (Settings → "
+            "Connectors) and sign in again."
         )
+
+    def _request(
+        self, user: User, step: str, auth: SyncAuth, call: Callable[[], T], **context: Any
+    ) -> T:
+        """Run one request to the sync server and log a ``sync.request`` event."""
+        base = {
+            "event": "sync.request",
+            "user": user.id,
+            "step": step,
+            "endpoint": _host(auth.endpoint),
+            "attempt": user.state.failures + 1,
+            **context,
+        }
+        start = time.monotonic()
+        try:
+            result = call()
+        except Exception as exc:
+            log.warning(
+                "sync request %s of user %s raised %s",
+                step,
+                user.id,
+                type(exc).__name__,
+                extra={
+                    **base,
+                    "outcome": "error",
+                    "duration_ms": round((time.monotonic() - start) * 1000),
+                    **error_fields(exc),
+                },
+            )
+            raise
+        extra: dict[str, Any] = {
+            **base,
+            "outcome": "ok",
+            "duration_ms": round((time.monotonic() - start) * 1000),
+        }
+        if isinstance(result, SyncOutput):
+            extra["required"] = SyncOutput.ChangesRequired.Name(result.required)
+            extra["server_message"] = result.server_message or None
+            extra["host_number"] = result.host_number
+            extra["new_endpoint"] = _host(result.new_endpoint)
+        log.info("sync request %s of user %s: ok", step, user.id, extra=extra)
+        return result
+
+    def _media_error(self, user: User, exc: Exception) -> None:
+        """Remember a media sync error; log it once per distinct message."""
+        message = str(exc)
+        if message != user.state.last_media_error:
+            log.warning(
+                "media sync of user %s reported an error",
+                user.id,
+                extra={"event": "sync.media_failed", "user": user.id, **error_fields(exc)},
+            )
+        user.state.last_media_error = message
+        user.save_state()
 
     def mark_dirty_locked(self, user: User) -> None:
         st = user.state
@@ -267,23 +361,24 @@ class SyncManager:
             return col, warnings
         if now < st.backoff_until:
             msg = (
-                f"AnkiWeb is unreachable ({st.last_sync_error}); next attempt after "
-                f"{_iso(st.backoff_until)}."
+                f"The last sync attempt failed (next attempt after "
+                f"{_iso(st.backoff_until)}): {st.last_sync_error}"
             )
             if not st.ever_synced:
                 raise SyncUnavailable(msg)
             if st.conflict:
                 raise SyncConflict(
-                    st.last_sync_error or "AnkiWeb requires a full sync.", st.full_sync
+                    st.last_sync_error or "The sync server answered with a full sync.",
+                    st.full_sync,
                 )
-            warnings.append(msg + " Working on the server copy; changes will be sent later.")
+            warnings.append(msg + " | Working on the server copy; changes are sent later.")
             return col, warnings
         try:
             warnings.extend(self.normal_sync_locked(user, allow_full_download=True, reason="pull"))
         except SyncUnavailable as exc:
             if not st.ever_synced:
                 raise
-            warnings.append(f"{exc} Working on the server copy; changes will be sent later.")
+            warnings.append(f"{exc} | Working on the server copy; changes are sent later.")
         return user.collection(), warnings
 
     def normal_sync_locked(
@@ -294,42 +389,20 @@ class SyncManager:
         auth = self.auth_for(user)
         st = user.state
         gen = user.change_gen
-        start = time.monotonic()
         try:
-            out = self.backend.sync_collection(col, auth)
+            out = self._request(
+                user,
+                "meta",
+                auth,
+                lambda: self.backend.sync_collection(col, auth),
+                reason=reason,
+                unsynced_before=st.dirty,
+            )
         except Exception as exc:
             problem = self._translate(user, exc)
-            log.info(
-                "sync (%s) of user %s raised %s",
-                reason,
-                user.id,
-                type(exc).__name__,
-                extra={
-                    "event": "sync.normal",
-                    "user": user.id,
-                    "reason": reason,
-                    "outcome": type(problem).__name__,
-                    "duration_ms": round((time.monotonic() - start) * 1000),
-                },
-            )
             if not isinstance(problem, SyncAuthError):
                 self._record_failure(user, str(problem))
             raise problem from exc
-        required_name = SyncOutput.ChangesRequired.Name(out.required)
-        log.info(
-            "sync (%s) of user %s: %s",
-            reason,
-            user.id,
-            required_name,
-            extra={
-                "event": "sync.normal",
-                "user": user.id,
-                "reason": reason,
-                "required": required_name,
-                "unsynced_before": user.state.dirty,
-                "duration_ms": round((time.monotonic() - start) * 1000),
-            },
-        )
         if out.new_endpoint:
             user.save_auth(auth.hkey, out.new_endpoint)
         required = out.required
@@ -337,40 +410,38 @@ class SyncManager:
             self._record_success(user, gen)
             return []
         details = self._full_sync_details(user, col, required)
+        answer = details["answer"]
         if allow_full_download and details["safe_to_download"]:
-            # Downloading only replaces the server copy, which here holds nothing that
-            # AnkiWeb lacks: never synced, or no unsynced changes and no local schema
-            # change. Real AnkiWeb answers FULL_SYNC (not FULL_DOWNLOAD) after another
-            # device uploaded a schema change, so this is the common case.
+            # Downloading only replaces the server copy, which holds nothing beyond the
+            # last successful sync: never synced, or no unsynced changes and no local
+            # schema change. (The integration test shows FULL_SYNC after another device
+            # uploaded a schema change.)
             first = not st.ever_synced
             backup = self._full_download_locked(user, auth)
             if first:
                 return []
             return [
-                "AnkiWeb required a full sync (usually a note type was restructured on "
-                "another device). The server copy had no unsynced changes, so it was "
-                "replaced with the collection from AnkiWeb; nothing was lost"
-                + (f" (backup: {backup})." if backup else ".")
+                f"The sync server answered {answer}. The server copy had no unsynced changes "
+                "and no local schema change, so it was replaced with the collection from the "
+                "sync server" + (f" (backup: {backup})." if backup else ".")
             ]
-        if details["ankiweb_empty"]:
+        if not details["download_offered"]:
             msg = (
-                "The collection on AnkiWeb is empty, while the server copy is not. Ask the "
-                "user whether AnkiWeb was reset on purpose. The server never uploads on its "
-                "own: to keep the collection, upload it to AnkiWeb from Anki on the user's "
-                "computer, then call sync(force_download=true)."
-            )
-        elif details["unsynced_changes_on_server"]:
-            msg = (
-                "AnkiWeb requires a full sync (probably a note type was restructured on "
-                "another device), but the server copy has unsynced changes that downloading "
-                "would discard. Tell the user what would be lost and call "
-                "sync(force_download=true) only after they confirm (a backup of the server "
-                "copy is kept)."
+                f"The sync server answered {answer}: the only full sync it offers is a one-way "
+                "upload from this server, which this server never does. Ask the user how to "
+                "proceed. " + FORCE_DOWNLOAD_EFFECT
             )
         else:
+            facts = []
+            if details["unsynced_changes_on_server"]:
+                facts.append("unsynced changes")
+            if details["local_schema_changed"]:
+                facts.append("a schema change that was not uploaded")
             msg = (
-                "AnkiWeb requires a full sync that would overwrite AnkiWeb with the server "
-                "copy; the server never does that on its own. " + FORCE_DOWNLOAD_HINT
+                f"The sync server answered {answer}. The server copy has "
+                f"{' and '.join(facts) or 'local changes'}; a download would discard them. "
+                "Tell the user and call sync(force_download=true) only after they confirm "
+                "(a backup of the server copy is kept). This server never uploads on its own."
             )
         st.conflict = True
         st.full_sync = details
@@ -388,7 +459,7 @@ class SyncManager:
             "unsynced_changes_on_server": unsynced,
             "local_schema_changed": local_schema,
             "pending_schema_upload": st.pending_schema_upload,
-            "ankiweb_empty": required == SyncOutput.FULL_UPLOAD,
+            "download_offered": required != SyncOutput.FULL_UPLOAD,
             "safe_to_download": wants_full
             and not unsynced
             and not local_schema
@@ -471,30 +542,21 @@ class SyncManager:
             backup = self.backup_locked(user, "before-download").name
         self._wait_media_idle_locked(user)
         col = user.collection()
-        log.info(
-            "full download for user %s",
-            user.id,
-            extra={"event": "sync.full_download", "user": user.id, "backup": backup},
-        )
-        start = time.monotonic()
         col.close_for_full_sync()
         try:
-            self.backend.full_sync(col, auth, upload=False)
+            self._request(
+                user,
+                "full_download",
+                auth,
+                lambda: self.backend.full_sync(col, auth, upload=False),
+                backup=backup,
+            )
         except Exception as exc:
             problem = self._translate(user, exc)
             self._record_failure(user, str(problem))
             raise problem from exc
         finally:
             col.reopen(after_full_sync=True)
-        log.info(
-            "full download for user %s done",
-            user.id,
-            extra={
-                "event": "sync.full_download_done",
-                "user": user.id,
-                "duration_ms": round((time.monotonic() - start) * 1000),
-            },
-        )
         st.pending_schema_upload = False
         self._record_success(user, user.change_gen)
         user.state.dirty = False
@@ -511,30 +573,17 @@ class SyncManager:
         user.save_state()
         self._wait_media_idle_locked(user)
         col = user.collection()
-        log.info(
-            "one-way upload after schema change for user %s",
-            user.id,
-            extra={"event": "sync.full_upload", "user": user.id},
-        )
-        start = time.monotonic()
         col.close_for_full_sync()
         try:
-            self.backend.full_sync(col, auth, upload=True)
+            self._request(
+                user, "full_upload", auth, lambda: self.backend.full_sync(col, auth, upload=True)
+            )
         except Exception as exc:
             problem = self._translate(user, exc)
             self._record_failure(user, str(problem))
             raise problem from exc
         finally:
             col.reopen(after_full_sync=True)
-        log.info(
-            "one-way upload for user %s done",
-            user.id,
-            extra={
-                "event": "sync.full_upload_done",
-                "user": user.id,
-                "duration_ms": round((time.monotonic() - start) * 1000),
-            },
-        )
         st.pending_schema_upload = False
         self._record_success(user, user.change_gen)
         st.dirty = False
@@ -572,7 +621,8 @@ class SyncManager:
                 self._upload_after_schema_change_locked(user, auth)
                 info["full_upload"] = "done"
                 info["next_step"] = (
-                    "On every other device choose 'Download from AnkiWeb' at the next sync."
+                    "At the next sync of every other device, Anki asks for a full sync; "
+                    "choose to download there."
                 )
             except SyncProblem as exc:
                 info["full_upload"] = f"failed: {exc}"
@@ -589,7 +639,7 @@ class SyncManager:
         auth = self.auth_for(user)
         if force_download:
             self._full_download_locked_forced(user, auth)
-            return ["The server copy was replaced with the collection from AnkiWeb."]
+            return ["The server copy was replaced with the collection from the sync server."]
         if st.pending_schema_upload:
             self._upload_after_schema_change_locked(user, auth)
             return ["The pending one-way upload completed."]
@@ -616,14 +666,8 @@ class SyncManager:
             if self.backend.media_sync_status(col).active:
                 return "already running"
         except Exception as exc:
-            user.state.last_media_error = str(exc)
-            user.save_state()
-        self.backend.start_media_sync(col, auth)
-        log.info(
-            "media sync started for user %s",
-            user.id,
-            extra={"event": "sync.media", "user": user.id},
-        )
+            self._media_error(user, exc)
+        self._request(user, "media_start", auth, lambda: self.backend.start_media_sync(col, auth))
         return "started"
 
     def media_status_locked(self, user: User) -> dict[str, Any]:
@@ -643,8 +687,7 @@ class SyncManager:
                         "removed": p.removed,
                     }
             except Exception as exc:
-                st.last_media_error = str(exc)
-                user.save_state()
+                self._media_error(user, exc)
                 result["active"] = False
         if st.last_media_error:
             result["last_error"] = st.last_media_error
@@ -662,8 +705,7 @@ class SyncManager:
                 try:
                     active = self.backend.media_sync_status(user.col).active
                 except Exception as exc:
-                    user.state.last_media_error = str(exc)
-                    user.save_state()
+                    self._media_error(user, exc)
                     return f"failed: {exc}"
                 if not active:
                     user.state.last_media_sync = time.time()

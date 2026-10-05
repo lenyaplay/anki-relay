@@ -45,6 +45,7 @@ class UserState:
     backoff_until: float = 0.0
     pending_schema_upload: bool = False
     conflict: bool = False
+    failing_since: float | None = None
     full_sync: dict | None = None
     auth_invalid: bool = False
     last_media_sync: float | None = None

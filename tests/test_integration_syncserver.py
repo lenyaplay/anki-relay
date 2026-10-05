@@ -222,7 +222,7 @@ async def test_real_sync_round_trip(tmp_path: Path, syncserver: str) -> None:
         desktop.schema_change_and_upload("FromDesktop")
         nt = await call(server, token, "get_note_type", name="Basic")
         assert [f["name"] for f in nt["fields"]][-1] == "FromDesktop"
-        assert "nothing was lost" in nt["warnings"][0]
+        assert "was replaced with the collection from the sync server" in nt["warnings"][0]
 
         # Same, but the relay has unsynced changes: it refuses to drop them silently.
         settings_push = server.app.settings
@@ -253,3 +253,35 @@ async def test_real_sync_round_trip(tmp_path: Path, syncserver: str) -> None:
     finally:
         server.stop()
         desktop.col.close()
+
+
+def test_rust_log_has_sync_details_and_no_secrets(tmp_path: Path, syncserver: str) -> None:
+    """ANKI_RUST_LOG=debug against a real sync server (REQ-005), in a separate process."""
+    desktop = Desktop(tmp_path / "desktop", syncserver)
+    desktop.add("on the server")
+    desktop.sync(on_full="upload")
+    desktop.col.close()
+
+    log_dir = tmp_path / "logs"
+    probe = Path(__file__).with_name("rust_log_probe.py")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(probe),
+            syncserver,
+            str(tmp_path / "data"),
+            str(log_dir),
+            EMAIL,
+            PASSWORD,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    hkey = proc.stdout.strip().splitlines()[-1]
+    text = (log_dir / "anki-rust.log").read_text(encoding="utf-8", errors="replace")
+    assert "fetched state" in text and "SyncMeta" in text
+    assert "\x1b[" not in text  # no ANSI colour codes in the file
+    for name, secret in {"password": PASSWORD, "hkey": hkey, "email": EMAIL}.items():
+        assert secret not in text, name
