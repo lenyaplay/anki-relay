@@ -1,0 +1,53 @@
+# Two modes, selected with COMPOSE_PROFILES in .env:
+#   COMPOSE_PROFILES=caddy  -> app + Caddy with automatic HTTPS (Let's Encrypt)
+#   COMPOSE_PROFILES=       -> app only, published on ${BIND_ADDRESS}:${APP_PORT}
+#                              for your own reverse proxy (see deploy/nginx.conf.example)
+services:
+  anki-relay:
+    build: .
+    image: anki-relay:latest
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Inside the container the app always listens on all interfaces;
+      # what is reachable from outside is decided by the port mapping below.
+      HOST: 0.0.0.0
+      PORT: ${PORT:-8000}
+      DATA_DIR: /data
+      # LOG_DIR= (empty) in .env: stdout only.
+      LOG_DIR: ${LOG_DIR-/logs}
+    ports:
+      # 127.0.0.1 by default: reachable only from this machine (nginx on the same VPS).
+      - "${BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8000}:${PORT:-8000}"
+    volumes:
+      - ./data:/data
+      # JSON log files (14 days by default) and debug bundles; only readable on the server.
+      - ./logs:/logs
+    # Time to push unsynced changes to AnkiWeb on shutdown.
+    stop_grace_period: 60s
+
+  caddy:
+    image: caddy:2
+    profiles: ["caddy"]
+    restart: unless-stopped
+    depends_on:
+      - anki-relay
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp" # HTTP/3
+    environment:
+      # The Caddyfile uses PUBLIC_URL as its site address, so Caddy obtains a
+      # certificate for exactly that host name.
+      PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL in .env}
+      UPSTREAM: anki-relay:${PORT:-8000}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

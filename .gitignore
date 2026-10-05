@@ -1,0 +1,25 @@
+# user data and secrets
+data/
+logs/
+.env
+*.anki2
+*.anki2-wal
+*.anki2-shm
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

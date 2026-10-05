@@ -1,0 +1,19 @@
+# The site address comes straight from PUBLIC_URL (e.g. https://anki-relay.example.com),
+# substituted by Caddy when it reads this file. Caddy then obtains and renews a
+# Let's Encrypt certificate for that host name.
+{$PUBLIC_URL} {
+	encode zstd gzip
+
+	reverse_proxy {$UPSTREAM} {
+		# MCP answers may stream (Server-Sent Events): pass bytes through immediately.
+		flush_interval -1
+		transport http {
+			read_timeout 300s
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+}
